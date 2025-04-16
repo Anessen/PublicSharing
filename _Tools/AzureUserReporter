@@ -1,0 +1,228 @@
+# Script: Interactive Entra ID User Search to Excel (Paste & Run with Restart/Append)
+# Version: 2.3 (Microsoft Graph + ImportExcel Module)
+# Creator: Joey Romaine
+# This script interactively searches Microsoft Entra ID (Azure AD) users and exports results to an Excel (.xlsx) file.
+# It clears the screen, prompts for a field to search (Title, Department, etc.), prompts for keywords,
+# performs a case-insensitive 'contains' search, prompts for an output filename, and allows appending
+# subsequent searches as new worksheets to the same Excel file within the session.
+# Each worksheet is named after the searched field. A final "Search Summary" sheet is added.
+# Designed to be pasted directly into a PowerShell session.
+
+# --- Prerequisites ---
+# 1. Install Microsoft Graph SDK (if not already installed):
+#    Install-Module Microsoft.Graph -Scope CurrentUser
+# 2. Install ImportExcel Module (if not already installed):
+#    Install-Module ImportExcel -Scope CurrentUser
+# 3. Connect to Microsoft Graph before pasting this script:
+#    Connect-MgGraph -Scopes "User.Read.All"
+#    (Ensure your account has the necessary permissions)
+
+# --- Start Script ---
+
+# Attempt to import the required module
+try {
+    Import-Module ImportExcel -ErrorAction Stop
+}
+catch {
+    Write-Error "ImportExcel module not found or failed to import. Please install it: Install-Module ImportExcel -Scope CurrentUser"
+    return # Exit if module is missing
+}
+
+# Variables to track state across multiple runs within the session
+$currentFilePath = $null
+$searchHistory = @() # Array to store details of each search performed
+
+do { # Start of the main loop to allow restarting
+    Clear-Host # Clear the screen for a clean start each time
+    Write-Host "Microsoft Entra ID User Search to Excel"
+    Write-Host "Ensure you are connected via Connect-MgGraph -Scopes User.Read.All"
+    Write-Host "Using ImportExcel module for output."
+    Write-Host "---------------------------------------------------------------------"
+
+    # --- File Handling (New or Append) ---
+    $outputAction = 'New' # Default action is New
+    if ($null -ne $currentFilePath) {
+        # If a file was used previously in this session, ask whether to append or start new
+        $appendChoice = ''
+        while ($appendChoice -notin @('a', 'n')) {
+            Write-Host "Previous file used: $currentFilePath"
+            $appendChoice = Read-Host "Append to this file (a) or start New file (n)?"
+            if ($appendChoice -notin @('a', 'n')) {
+                Write-Warning "Invalid input. Please enter 'a' for Append or 'n' for New."
+            }
+        }
+        if ($appendChoice -eq 'a') {
+            $outputAction = 'Append'
+            Write-Host "Will append new worksheet to: $currentFilePath" -ForegroundColor Cyan
+        } else {
+            $currentFilePath = $null # Reset current file path to force asking for a new name
+        }
+    }
+
+    # If starting a new file (or first run), get the filename
+    if ($null -eq $currentFilePath) {
+        $OutputFileName = Read-Host "Enter the name for the new Excel output file (e.g., user_report)"
+        if ([string]::IsNullOrWhiteSpace($OutputFileName)) {
+            Write-Warning "No output filename provided. Defaulting to 'EntraID_User_Search_Results.xlsx'"
+            $OutputFileName = "EntraID_User_Search_Results.xlsx"
+        }
+        # Ensure the filename ends with .xlsx
+        if (-not $OutputFileName.EndsWith('.xlsx')) {
+            $OutputFileName += '.xlsx'
+        }
+        # Construct the full path in the current directory ($PWD is the current working directory)
+        $currentFilePath = Join-Path -Path $PWD -ChildPath $OutputFileName
+        Write-Host "New Excel file will be created/used: $currentFilePath" -ForegroundColor Cyan
+    }
+     Write-Host "---------------------------------------------------------------------"
+
+
+    # --- User Prompts ---
+
+    # 1. Prompt for search field (using numbers)
+    $fieldChoice = ''
+    $validChoices = 1..7 # Creates an array of numbers from 1 to 7
+    while ($fieldChoice -notin $validChoices) {
+        Write-Host "Select the field to search:"
+        Write-Host "  1) Title (JobTitle)"
+        Write-Host "  2) Department"
+        Write-Host "  3) sAMAccountName (OnPremisesSamAccountName)"
+        Write-Host "  4) User Principal Name (UPN)"
+        Write-Host "  5) Display Name"
+        Write-Host "  6) Email (mail)"
+        Write-Host "  7) Company Name"
+        $fieldChoice = Read-Host "Enter choice (1-7)"
+        if ($fieldChoice -notin $validChoices) {
+            Write-Warning "Invalid input. Please enter a number between 1 and 7."
+        }
+    }
+
+    # Determine the actual property name in Entra ID/Graph based on the choice
+    $propertyToSearch = switch ($fieldChoice) {
+        '1' { 'JobTitle' }
+        '2' { 'Department' }
+        '3' { 'OnPremisesSamAccountName' }
+        '4' { 'UserPrincipalName' }
+        '5' { 'DisplayName' }
+        '6' { 'Mail' }
+        '7' { 'CompanyName' }
+        Default { Write-Error "Invalid selection somehow passed validation. Exiting."; return }
+    }
+    Write-Host "Searching field: $propertyToSearch" -ForegroundColor Cyan
+
+    # 2. Prompt for keywords
+    $keywordsInput = Read-Host "Enter keywords, separated by commas (e.g., manager, testuser, @domain.com)"
+    if ([string]::IsNullOrWhiteSpace($keywordsInput)) {
+        Write-Error "No keywords entered. Skipping this search."
+        $runAgain = Read-Host "Do you want to run another search? (y/n)"
+        continue
+    }
+    # Split, trim whitespace from each keyword, and remove empty entries
+    $keywords = $keywordsInput.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    if ($keywords.Count -eq 0) {
+         Write-Error "No valid keywords extracted. Skipping this search."
+         $runAgain = Read-Host "Do you want to run another search? (y/n)"
+         continue
+    }
+    $keywordsString = $keywords -join ', ' # Store for summary
+    Write-Host "Keywords to search for: $keywordsString" -ForegroundColor Cyan
+    Write-Host "---------------------------------------------------------------------"
+
+
+    # --- Search Logic ---
+    try {
+        Write-Host "Attempting to retrieve users from Microsoft Graph..." -ForegroundColor Yellow
+        # Retrieve all users - this can be slow on large tenants.
+        $propertiesToSelect = @(
+            'DisplayName', 'UserPrincipalName', 'JobTitle', 'Department',
+            'OnPremisesSamAccountName', 'Mail', 'CompanyName'
+        )
+        $allUsers = Get-MgUser -All -Property $propertiesToSelect -ErrorAction Stop
+
+        Write-Host "Retrieved $($allUsers.Count) total users. Filtering locally..." -ForegroundColor Yellow
+
+        $regexPattern = ($keywords | ForEach-Object { [regex]::Escape($_) }) -join '|'
+
+        # Filter users client-side
+        $filteredUsers = $allUsers | Where-Object {
+            $propertyValue = $_.$propertyToSearch
+            ($null -ne $propertyValue) -and ($propertyValue -match $regexPattern)
+        }
+
+        if ($filteredUsers) {
+            $count = if ($filteredUsers -is [array]) { $filteredUsers.Count } else { ($filteredUsers | Measure-Object).Count }
+            Write-Host "Found $count users matching the criteria." -ForegroundColor Green
+
+            # Select the desired properties for standard output
+            $outputData = $filteredUsers | Select-Object DisplayName, UserPrincipalName, JobTitle, Department
+
+            # --- Export to Excel using ImportExcel ---
+            # Sanitize the property name for use as a worksheet name
+            # Replace invalid chars: \ / * ? : [ ]
+            $sanitizedWorksheetName = $propertyToSearch -replace '[\\/\*\?\[\]:]','_'
+            # Trim to Excel's 31-character limit
+            $sanitizedWorksheetName = $sanitizedWorksheetName.Substring(0, [System.Math]::Min($sanitizedWorksheetName.Length, 31))
+
+            Write-Host "Exporting to worksheet '$sanitizedWorksheetName' in '$currentFilePath'..." -ForegroundColor Yellow
+            # Export-Excel will create the file if it doesn't exist, or add/replace a worksheet.
+            # Using -Append ensures it adds a new sheet if the file exists, otherwise creates the file with the sheet.
+            $outputData | Export-Excel -Path $currentFilePath -WorksheetName $sanitizedWorksheetName -Append -AutoSize -AutoFilter -FreezeTopRow -BoldTopRow #-TableStyle Medium6
+            Write-Host "Results successfully exported." -ForegroundColor Green
+
+            # Add details to search history
+             $searchHistory += [PSCustomObject]@{
+                Timestamp      = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                SearchedField  = $propertyToSearch
+                Keywords       = $keywordsString
+                ResultsCount   = $count
+                OutputFile     = $currentFilePath
+                WorksheetName  = $sanitizedWorksheetName
+            }
+
+        } else {
+            Write-Host "No users found matching the specified criteria." -ForegroundColor Yellow
+             # Optionally add 'no result' to history
+             $searchHistory += [PSCustomObject]@{
+                Timestamp      = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                SearchedField  = $propertyToSearch
+                Keywords       = $keywordsString
+                ResultsCount   = 0
+                OutputFile     = $currentFilePath
+                WorksheetName  = "(No Results)"
+            }
+        }
+    }
+    catch {
+        Write-Error "An error occurred during the search or export:"
+        Write-Error "Message: $($_.Exception.Message)"
+        if ($_.Exception.InnerException) { Write-Error "Inner Exception: $($_.Exception.InnerException.Message)" }
+        Write-Error "Please ensure you are connected ('Connect-MgGraph -Scopes User.Read.All'), have permissions, and have the ImportExcel module installed."
+        Write-Error "Also check if the selected property (e.g., OnPremisesSamAccountName) is populated for users in your tenant."
+    }
+
+    # Ask to run again
+    Write-Host "---------------------------------------------------------------------"
+    $runAgain = Read-Host "Do you want to run another search? (y/n)"
+
+} while ($runAgain -eq 'y' -or $runAgain -eq 'Y') # Loop condition
+
+# --- Final Summary Export ---
+if ($searchHistory.Count -gt 0 -and $null -ne $currentFilePath) {
+    Write-Host "Adding Search Summary worksheet to '$currentFilePath'..." -ForegroundColor Yellow
+    try {
+        $searchHistory | Export-Excel -Path $currentFilePath -WorksheetName "Search Summary" -Append -AutoSize -AutoFilter -FreezeTopRow -BoldTopRow #-TableStyle Medium6 -ErrorAction Stop
+        Write-Host "Search Summary worksheet added successfully." -ForegroundColor Green
+    } catch {
+        Write-Error "Failed to add Search Summary worksheet."
+        Write-Error "Message: $($_.Exception.Message)"
+    }
+} else {
+     Write-Host "No searches were performed or file path not set, skipping summary sheet."
+}
+
+
+Write-Host "Script finished."
+# --- End Script ---
+
+# Optional: Disconnect when completely done
+# Disconnect-MgGraph
