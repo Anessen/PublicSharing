@@ -1,0 +1,332 @@
+# O365 User Reporting Script
+# Author: Joey Romaine 
+# Contact: (X)Tank23x0
+# --------------------------
+# This script generates a comprehensive report of all users in your O365 tenant
+# including both on-premise Active Directory and Microsoft Graph data.
+#
+# REQUIREMENTS:
+# - Active Directory module
+# - Microsoft Graph PowerShell SDK
+# - Exchange Online PowerShell module
+# - Admin rights for both on-premise AD and O365
+#
+# SCRIPT OUTLINE:
+# 1. Connect to required services (AD, Graph, Exchange)
+# 2. Gather on-premise AD user data
+# 3. Gather Microsoft Graph user data
+# 4. Gather O365 license information (optional)
+# 5. Combine the data
+# 6. Export the report
+
+# Import required modules
+Import-Module ActiveDirectory
+# Check if Microsoft Graph modules are installed
+$requiredModules = @("Microsoft.Graph.Authentication", "Microsoft.Graph.Users", "Microsoft.Graph.Users.Actions", "Microsoft.Graph.Identity.SignIns")
+$modulesToInstall = @()
+
+foreach ($module in $requiredModules) {
+    if (-not (Get-Module -ListAvailable -Name $module)) {
+        $modulesToInstall += $module
+    }
+}
+
+if ($modulesToInstall.Count -gt 0) {
+    Write-Host "Some required Microsoft Graph modules are not installed." -ForegroundColor Yellow
+    Write-Host "Installing modules: $($modulesToInstall -join ', ')" -ForegroundColor Yellow
+    
+    foreach ($module in $modulesToInstall) {
+        Install-Module -Name $module -Scope CurrentUser -Force
+    }
+}
+
+# Clear the screen and show title
+Clear-Host
+Write-Host "-------------------------" -ForegroundColor Cyan
+Write-Host "O365 User Reporting Script" -ForegroundColor Cyan
+Write-Host "-------------------------" -ForegroundColor Cyan
+Write-Host ""
+
+# Functions
+
+function Connect-RequiredServices {
+    Write-Host "Connecting to services..." -ForegroundColor Green
+    
+    # Connect to Microsoft Graph
+    Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Yellow
+    Connect-MgGraph -Scopes "User.Read.All", "Directory.Read.All", "AuditLog.Read.All"
+    
+    # Verify AD module is loaded
+    try {
+        Get-ADUser -Filter * -ResultSetSize 1 | Out-Null
+        Write-Host "Connected to Active Directory." -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Error connecting to Active Directory. Make sure you're running this script with appropriate permissions." -ForegroundColor Red
+        exit
+    }
+    
+    Write-Host "All services connected." -ForegroundColor Green
+    Write-Host ""
+}
+
+function Get-ADUserDetails {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$UserPrincipalName
+    )
+    
+    try {
+        # Extract samAccountName from UPN
+        $samAccountName = $UserPrincipalName.Split('@')[0]
+        
+        # Get AD user
+        $adUser = Get-ADUser -Filter "SamAccountName -eq '$samAccountName'" -Properties LastLogon, PasswordLastSet, Manager, Created, whenCreated
+        
+        if ($adUser) {
+            # Convert lastLogon to DateTime (it's stored as Int64)
+            $lastLogonDate = [DateTime]::FromFileTime($adUser.LastLogon)
+            if ($adUser.LastLogon -eq 0) { $lastLogonDate = $null }
+            
+            # Get manager display name if exists
+            $managerName = $null
+            if ($adUser.Manager) {
+                $manager = Get-ADUser -Identity $adUser.Manager -Properties DisplayName
+                $managerName = $manager.DisplayName
+            }
+            
+            # Calculate days since password reset
+            $daysSincePasswordReset = $null
+            if ($adUser.PasswordLastSet) {
+                $daysSincePasswordReset = [math]::Round((New-TimeSpan -Start $adUser.PasswordLastSet -End (Get-Date)).TotalDays)
+            }
+            
+            return [PSCustomObject]@{
+                LastLogonOnPrem = $lastLogonDate
+                PasswordLastSet = $adUser.PasswordLastSet
+                DaysSincePasswordReset = $daysSincePasswordReset
+                Manager = $managerName
+                CreationDate = if ($adUser.whenCreated) { $adUser.whenCreated } else { $adUser.Created }
+            }
+        }
+        else {
+            return [PSCustomObject]@{
+                LastLogonOnPrem = $null
+                PasswordLastSet = $null
+                DaysSincePasswordReset = $null
+                Manager = $null
+                CreationDate = $null
+            }
+        }
+    }
+            catch {
+        Write-Warning "Error retrieving AD data for $($UserPrincipalName): $($_.Exception.Message)"
+        return [PSCustomObject]@{
+            LastLogonOnPrem = $null
+            PasswordLastSet = $null
+            DaysSincePasswordReset = $null
+            Manager = $null
+            CreationDate = $null
+        }
+    }
+}
+
+function Get-O365LicenseDescription {
+    param (
+        [string]$SkuId
+    )
+    
+    # Define mapping of license SKUs to readable names
+    $licenseMap = @{
+        "c7df2760-2c81-4ef7-b578-5b5392b571df" = "Microsoft 365 E5"
+        "b05e124f-c7cc-45a0-a6aa-8cf78c946968" = "Microsoft 365 E5 Without Audio Conferencing"
+        "06ebc4ee-1bb5-47dd-8120-11324bc54e06" = "Microsoft 365 E5 Developer"
+        "26d45bd9-adf1-46cd-a9e1-51e9a5524128" = "Microsoft 365 E5 Compliance"
+        "4f7ecaf1-e9d6-4cac-9687-e22eb3dfdd70" = "Microsoft 365 E5 Security"
+        "d4fa2fa3-9e90-4438-a9e5-de18f96c2572" = "Microsoft 365 E5 Information Protection and Governance"
+        "3b555118-da6a-4418-894f-7df1e2096870" = "Microsoft 365 E5 Insider Risk Management"
+        "6db1f1db-2b46-403f-be40-e39395f08dbb" = "Microsoft 365 E5 Compliance - Archiving Add-on"
+        "ea4a4090-525a-4453-bfd6-094a7f2872fc" = "Microsoft 365 E5 Security for EMS E3"
+        "efccb6f7-5641-4e0e-bd10-b4976e1bf68e" = "Microsoft 365 E3"
+        "f245ecc8-75af-4f8e-b61f-27d8114de5f3" = "Microsoft 365 Business Standard"
+        "cbdc14ab-d96c-4c30-b9f4-6ada7cdc1d46" = "Microsoft 365 Business Premium"
+        "f30db892-07e9-47e9-837c-80727f46fd3d" = "Microsoft 365 F1"
+        "e823a118-f223-4261-a939-a30cdbac2fa8" = "Microsoft 365 F3"
+        "3e90e155-4777-451f-b698-2ebef27ce964" = "Office 365 E5"
+        "bf0f5feb-11d5-466c-a243-4c7bc2b36777" = "Office 365 E3"
+        "f6e6fc45-648b-4a5b-be68-68e97a78c708" = "Office 365 E1"
+        "3b2c29f8-b775-41e4-9450-06bd2642a1ea" = "Office 365 F3"
+        "4b585984-651b-448a-9e53-3b10f069cf7f" = "Office 365 F1"
+        "cdd28e44-67e3-425e-be4c-737fab2899d3" = "Enterprise Mobility + Security E5"
+        "329ecf94-3e40-4255-bd86-83e95ce23c2c" = "Enterprise Mobility + Security E3"
+        "18282083-4b22-484c-969a-8df1d0b37c4a" = "Azure Active Directory Premium P2"
+        "078d2b04-f1bd-4111-bbd4-b4b1b354cef4" = "Azure Active Directory Premium P1"
+        # Add more licenses as needed
+    }
+    
+    if ($licenseMap.ContainsKey($SkuId)) {
+        return $licenseMap[$SkuId]
+    }
+    else {
+        return $SkuId  # Return the SKU ID if no friendly name is found
+    }
+}
+
+function Get-UserReport {
+    [CmdletBinding()]
+    param (
+        [Parameter()]
+        [switch]$IncludeLicenses = $false
+    )
+    
+    Write-Host "Generating user report..." -ForegroundColor Green
+    
+    # Get all Office 365 users from Graph API
+    Write-Host "Retrieving users from Microsoft Graph..." -ForegroundColor Yellow
+    $users = Get-MgUser -All -Property Id, DisplayName, UserPrincipalName, Mail, AccountEnabled, CreatedDateTime, SignInActivity
+    Write-Host "Found $($users.Count) users." -ForegroundColor Green
+    
+    # Initialize result array
+    $results = @()
+    $counter = 0
+    $totalUsers = $users.Count
+    
+    # Process each user
+    foreach ($user in $users) {
+        $counter++
+        $progress = [math]::Round(($counter / $totalUsers) * 100)
+        Write-Progress -Activity "Processing users" -Status "$counter of $totalUsers ($progress%)" -PercentComplete $progress -CurrentOperation $user.UserPrincipalName
+        
+        Write-Verbose "Processing user: $($user.UserPrincipalName)"
+        
+        # Get on-premise AD data
+        $adData = Get-ADUserDetails -UserPrincipalName $user.UserPrincipalName
+        
+        # Get license information if requested
+        $licenses = @()
+        if ($IncludeLicenses) {
+            try {
+                $userLicenses = Get-MgUserLicenseDetail -UserId $user.Id
+                foreach ($license in $userLicenses) {
+                    $licenses += Get-O365LicenseDescription -SkuId $license.SkuId
+                }
+            }
+            catch {
+                Write-Warning "Error retrieving license info for $($user.UserPrincipalName): $($_.Exception.Message)"
+            }
+        }
+        
+        # Create result object
+        $userObject = [PSCustomObject]@{
+            DisplayName = $user.DisplayName
+            UserPrincipalName = $user.UserPrincipalName
+            Email = $user.Mail
+            Enabled = $user.AccountEnabled
+            CreatedDateTime = $user.CreatedDateTime
+            LastSignInDateTime = $user.SignInActivity.LastSignInDateTime
+            LastSuccessfulSignInDateTime = $user.SignInActivity.LastSuccessfulSignInDateTime
+            LastNonInteractiveSignInDateTime = $user.SignInActivity.LastNonInteractiveSignInDateTime
+            LastLogonOnPrem = $adData.LastLogonOnPrem
+            PasswordLastSet = $adData.PasswordLastSet
+            DaysSincePasswordReset = $adData.DaysSincePasswordReset
+            Manager = $adData.Manager
+            CreationDateAD = $adData.CreationDate
+        }
+        
+        # Add licenses if requested
+        if ($IncludeLicenses) {
+            $userObject | Add-Member -NotePropertyName "Licenses" -NotePropertyValue ($licenses -join ", ")
+        }
+        
+        $results += $userObject
+    }
+    
+    Write-Progress -Activity "Processing users" -Completed
+    return $results
+}
+
+function Export-UserReport {
+    param (
+        [Parameter(Mandatory = $true)]
+        [array]$UserReport,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+    
+    try {
+        $UserReport | Export-Csv -Path $Path -NoTypeInformation
+        Write-Host "Report exported successfully to: $Path" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Error exporting report: $_" -ForegroundColor Red
+    }
+}
+
+# Main script
+try {
+    # Connect to required services
+    Connect-RequiredServices
+    
+    # Prompt user for license inclusion
+    $includeLicenses = $false
+    $response = Read-Host "Would you like to include O365 license information in the report? (Y/N)"
+    if ($response -eq "Y" -or $response -eq "y") {
+        $includeLicenses = $true
+        Write-Host "License information will be included in the report." -ForegroundColor Green
+    }
+    else {
+        Write-Host "License information will not be included in the report." -ForegroundColor Yellow
+    }
+    
+    # Generate the report
+    $report = Get-UserReport -IncludeLicenses:$includeLicenses
+    
+    # Export the report
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $currentDir = (Get-Location).Path
+    $reportPath = Join-Path -Path $currentDir -ChildPath "O365UserReport-$timestamp.csv"
+    Export-UserReport -UserReport $report -Path $reportPath
+    
+    # Provide summary
+    Write-Host ""
+    Write-Host "Summary:" -ForegroundColor Cyan
+    Write-Host "---------" -ForegroundColor Cyan
+    Write-Host "Total users processed: $($report.Count)" -ForegroundColor White
+    Write-Host "Enabled users: $(($report | Where-Object { $_.Enabled -eq $true }).Count)" -ForegroundColor White
+    Write-Host "Disabled users: $(($report | Where-Object { $_.Enabled -eq $false }).Count)" -ForegroundColor White
+    if ($includeLicenses) {
+        $uniqueLicenses = $report | Where-Object { $_.Licenses } | ForEach-Object { $_.Licenses.Split(", ") } | Sort-Object -Unique
+        Write-Host "License types found in environment: $($uniqueLicenses.Count)" -ForegroundColor White
+        Write-Host "License breakdown:" -ForegroundColor White
+        foreach ($license in $uniqueLicenses) {
+            $count = ($report | Where-Object { $_.Licenses -like "*$license*" }).Count
+            Write-Host "  - $($license): $count users" -ForegroundColor White
+        }
+    }
+    
+    Write-Host ""
+    Write-Host "Report generated successfully. File saved to: $reportPath" -ForegroundColor Green
+    
+}
+catch {
+    Write-Host "An error occurred: $($_.Exception.Message)" -ForegroundColor Red
+}
+finally {
+    # Disconnect from services
+    try { Disconnect-MgGraph -ErrorAction SilentlyContinue } catch {}
+    Write-Host "Script execution completed." -ForegroundColor Cyan
+}
+
+# SCRIPT NOTES:
+# -------------
+# PROMPTS:
+# 1. Would you like to include O365 license information in the report? (Y/N)
+#
+# ANSWERS:
+# - Y: Include license information in the report
+# - N: Skip license information
+#
+# OUTPUT:
+# - CSV file with all user information named "O365UserReport-[timestamp].csv"
+# - Console summary of users and license distribution
