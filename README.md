@@ -1,12 +1,13 @@
 I have a serious history. Do not track me if you do not want to be tracked.
 
-I am releasing my latest tools I know can help other governing security in the Microsoft world. 
+I am releasing my latest tools I know can help others governing security. 
+
+Intgrity. Service. Excellence.
 
 Stay tuned! Stay safe!
 
+Questions/Concerns/Ideas: 
+  Tank23x0@proton.me
+  https://x.com/Tank23x0
 
-Questions/Concerns/Tool Ideas: 
-joeyromaine@pm.me
-https://x.com/Tank23x0
 
-Intgrity. Service. Excellence.
